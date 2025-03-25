@@ -1,0 +1,4 @@
+cryptography #for encryption
+boto3 #connect S3 dependancies
+mlflow
+psycopg2-binary #for comunicating with postger db
