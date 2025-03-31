@@ -316,27 +316,29 @@ services:
     networks:
       - fraud-detection
 
-  # producer:
-  #   build: ./producer
-  #   env_file: .env
-  #   deploy:
-  #     replicas: 2
-  #     resources:
-  #       limits:
-  #         cpus: '1'
-  #         memory: 1G
-  #   networks:
-  #     - fraud-detection
 
-  # inference:
-  #   build: ./inference
-  #   env_file: .env
-  #   volumes:
-  #     - ./models:/app/models
-  #     - ./config.yaml:/app/config.yaml
-  #     - ./env:/app/.env
-  #   networks:
-  #     - fraud-detection
+  producer:
+    build: ./producer
+    env_file: .env
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+    networks:
+      - fraud-detection
+
+#  inference:
+#    build: ./inference
+#    env_file: .env
+#    volumes:
+#      - ./models:/app/models
+#      - ./config.yaml:/app/config.yaml
+#      - ./env:/app/.env
+#    networks:
+#      - fraud-detection
+#
 
 volumes:
   postgres-db-volume:
