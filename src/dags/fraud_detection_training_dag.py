@@ -59,7 +59,7 @@ with DAG(
     )
     validate_environment >> training_task >> cleanup_task
 
-    #Documentation
+    #Documentation for Airflow
     dag.doc_md = """
     #Financial fraud detection pipeline
     Daily training fraud detection model using:
