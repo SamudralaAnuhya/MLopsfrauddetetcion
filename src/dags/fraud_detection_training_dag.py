@@ -22,9 +22,9 @@ def _train_model(**context):
     try:
         logger.info('Initializing fraud detection training')
         trainer = FraudDetectionTraining()
-        # model, precision = trainer.train_model()
-        # return {'status': 'success', 'precision': precision}
-        return {'status': 'success'}
+        model, precision = trainer.train_model()
+        return {'status': 'success', 'precision': precision}
+
     except Exception as e:
         logger.error('Training failed: %s', str(e), exc_info=True)
         raise AirflowException(f'Model training failed: {str(e)}')

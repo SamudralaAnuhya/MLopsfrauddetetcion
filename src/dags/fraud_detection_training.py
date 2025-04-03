@@ -1,10 +1,13 @@
+import json
 import logging
 import os
 import mlflow
+import pandas as pd
 
 from airflow.utils import yaml
 from dotenv import load_dotenv
 import boto3
+from kafka import KafkaConsumer
 
 # Configure dual logging to file and stdout with structured format
 logging.basicConfig(
@@ -122,3 +125,60 @@ class FraudDetectionTraining:
                 logger.info('Created missing MLFlow bucket: %s', mlflow_bucket)
         except Exception as e:
             logger.error('Minio connection failed: %s', str(e))
+
+    def read_from_kafka(self) -> pd.DataFrame:
+        """
+        Reads data from Kafka
+        secure authentication to kafka and returns it as a dataframe
+        data quality checks
+            schema validation
+            fraud column exists
+            finding total amount of fraud transactions are available
+        """
+
+        try:
+            topic = self.config['kafka']['topic']
+            logger.info('Connecting to kafka topic %s', topic)
+
+            # connecting to kafka,connections from config.yaml
+            consumer = KafkaConsumer(
+                topic,
+                bootstrap_servers=self.config['kafka']['bootstrap_servers'].split(','),
+                security_protocol='SASL_SSL',
+                sasl_mechanism='PLAIN',
+                sasl_plain_username=self.config['kafka']['username'],
+                sasl_plain_password=self.config['kafka']['password'],
+                value_deserializer=lambda x: json.loads(x.decode('utf-8')),
+                auto_offset_reset='earliest',
+                consumer_timeout_ms=self.config['kafka'].get('timeout', 10000)
+            )
+            # list comprehension for our data
+            messages = [msg.value for msg in consumer]
+            consumer.close()
+
+            df = pd.DataFrame(messages)
+            if df.empty:
+                raise ValueError('No messages received from Kafka')
+
+            # making same time format same as in producer - generate_transaction
+            df['timestamp'] = pd.to_datetime(df['timestamp'], utc=True)
+
+            # checking whether our main column for training is there or not(is_fraud)
+            if 'is_fraud' not in df.columns:
+                raise ValueError('Fraud label (is_fraud) missing from Kafka data')
+
+            # how much fraud transactions are there in data
+            fraud_rate = df['is_fraud'].mean() * 100
+            logger.info('Kafka data read successfully with fraud rate: %.2f%%', fraud_rate)
+            return df
+        except Exception as e:
+            logger.error('Failed to read data from Kafka: %s', str(e), exc_info=True)
+            raise
+
+    def train_model(self):
+        try:
+            logger.info('starting training model')
+            df = self.read_from_kafka()
+
+        except Exception as e:
+            pass
