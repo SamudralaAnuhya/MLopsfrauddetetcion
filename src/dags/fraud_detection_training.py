@@ -126,6 +126,60 @@ class FraudDetectionTraining:
         except Exception as e:
             logger.error('Minio connection failed: %s', str(e))
 
+    def create_feature(self, df: pd.DataFrame):
+        """
+        1. Temporal Features:
+           - Transaction hour
+           - Night/weekend indicators
+
+        2. Behavioral Features:
+           - 24h user activity window
+
+        3. Monetary Features:
+           - Amount to historical average ratio for 7 days before
+
+        4. Merchant Risk:
+           - Predefined high-risk merchant list
+        """
+        # handle time zone difference (sort all transactions)
+        df = df.sort_values(['user_id', 'timestamp']).copy()
+
+        # ---- Temporal Feature Engineering ----
+        df['transaction_hour'] = df['timestamp'].dt.hour
+        # transactions happened between 11pm - 5am marked as night
+        df['is_night'] = ((df['transaction_hour'] >= 22) | (df['transaction_hour'] < 5)).astype(int)
+        # flagging weekend(sat ,sun) ....day starts with (mon-0 , tue-1...sat-5,sun-6)
+        df['is_weekend'] = df['timestamp'].dt.dayofweek >= 5
+        # finding the date of transaction
+        df['transaction_day'] = df['timestamp'].dt.day
+
+        # -- Behavioral Feature Engineering --
+        # counting number of transactions  in last 24 hours (multiple like 50 in 1 day is again flag)
+        df['user_activity_24h'] = df.groupby('user_id', group_keys=False).apply(
+            lambda g: g.rolling('24h', on='timestamp', closed='left')['amount'].count().fillna(0)
+        )
+
+        # -- Monetary Feature Engineering --
+        # pattern based on last week mean amount (current is 1000 but in the avg of daily last week is 100 so flag it )
+        # Relative amount detection compared to user's historical pattern
+        df['amount_to_avg_ratio'] = df.groupby('user_id', group_keys=False).apply(
+            lambda g: (g['amount'] / g['amount'].rolling(7, min_periods=1).mean()).fillna(1.0)
+        )
+
+        # -- Merchant Risk Profiling --
+        # External risk intelligence integration point  (#crypto)
+        high_risk_merchants = self.config.get('high_risk_merchants', ['QuickCash', 'GlobalDigital', 'FastMoneyX'])
+        df['merchant_risk'] = df['merchant'].isin(high_risk_merchants).astype(int)
+
+        feature_cols = [
+            'amount', 'is_night', 'is_weekend', 'transaction_day', 'user_activity_24h',
+            'amount_to_avg_ratio', 'merchant_risk', 'merchant']
+
+        # checking if main column is there or not (fraud)
+        if 'is_fraud' not in df.columns:
+            raise ValueError('Missing target column "is_fraud"')
+        return df[feature_cols + ['is_fraud']]
+
     def read_from_kafka(self) -> pd.DataFrame:
         """
         Reads data from Kafka
@@ -176,9 +230,33 @@ class FraudDetectionTraining:
             raise
 
     def train_model(self):
+        """
+                End-to-end training pipeline implementing ML best practices
+
+                1. Data ingestion (read data from apache kafka and validating)
+                2. Feature engineering (categorize , numerical - onehot encoding )
+                3. Spliiting Train and Test data
+                4. Class Imbalance Mitigation (SMOTE)
+                5. Hyperparameter Optimization(RandomizedSearchCV)
+                6. Threshold Tuning(which threshold is fraud and not fraud)
+                7. Model Evaluation
+                8. Artifact Logging
+                9. Model Registry
+
+                Implements MLflow experiment tracking for full reproducibility.
+                """
         try:
             logger.info('starting training model')
+            # Data ingestion
             df = self.read_from_kafka()
+            # feature engineering from raw data
+            data = self.create_feature(df)
+            # train and test split
+            X = data.drop(columns=['is_fraud'])
+            y = data['is_fraud']
+
+
+
 
         except Exception as e:
             pass
