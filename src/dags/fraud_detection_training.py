@@ -232,7 +232,6 @@ class FraudDetectionTraining:
     def train_model(self):
         """
                 End-to-end training pipeline implementing ML best practices
-
                 1. Data ingestion (read data from apache kafka and validating)
                 2. Feature engineering (categorize , numerical - onehot encoding )
                 3. Spliiting Train and Test data
@@ -242,7 +241,6 @@ class FraudDetectionTraining:
                 7. Model Evaluation
                 8. Artifact Logging
                 9. Model Registry
-
                 Implements MLflow experiment tracking for full reproducibility.
                 """
         try:
