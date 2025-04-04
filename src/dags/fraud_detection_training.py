@@ -1,13 +1,27 @@
 import json
 import logging
 import os
+
+import joblib
 import mlflow
 import pandas as pd
+import numpy as np
 
 from airflow.utils import yaml
 from dotenv import load_dotenv
 import boto3
+from imblearn.over_sampling import SMOTE
+from matplotlib import pyplot as plt
+from mlflow.models import infer_signature
+from numpy.array_api import astype
 from kafka import KafkaConsumer
+from sklearn.compose import ColumnTransformer
+from sklearn.model_selection import train_test_split, RandomizedSearchCV, StratifiedKFold
+from sklearn.pipeline import Pipeline as ImbPipeline
+from sklearn.preprocessing import OrdinalEncoder
+from xgboost import XGBClassifier
+from sklearn.metrics import (make_scorer, fbeta_score, precision_recall_curve, average_precision_score, precision_score,
+                             recall_score, f1_score, confusion_matrix)
 
 # Configure dual logging to file and stdout with structured format
 logging.basicConfig(
@@ -249,12 +263,160 @@ class FraudDetectionTraining:
             df = self.read_from_kafka()
             # feature engineering from raw data
             data = self.create_feature(df)
+
             # train and test split
             X = data.drop(columns=['is_fraud'])
             y = data['is_fraud']
 
+            # Class imbalance safeguards
+            # no fraud scenarios
+            if y.sum() == 0:
+                raise ValueError('No positive samples in training data')
+                # very less fraud scenarios for tranining we need to do augmentation
+            if y.sum() < 10:
+                logger.warning('Low positive samples: %d. Consider additional data augmentation', y.sum())
 
+            X_train, X_test, y_train, y_test = train_test_split(
+                X, y,
+                test_size=self.config['model'].get('test_size', 0.2),  # model is from config.yaml
+                stratify=y,  # Keeps class balance in both splits
+                random_state=self.config['model'].get('seed', 42)
+            )
 
+            # Categorical feature preprocessing
+
+            preprocessor = ColumnTransformer([
+                ('merchant_encoder',
+                 OrdinalEncoder(  # ordinl(medium,low,high),,onehot(red,green , blue) everyone has same weight
+                     handle_unknown='use_encoded_value',
+                     # If during inference the model sees a merchant it hasn't seen during training,
+                     unknown_value=-1,  # it won’t crash — it assigns unknown_value=-1.
+                     dtype=np.float32  # more memory_efficient for XGBoost
+                 ), ['merchant'])
+            ], remainder='passthrough')  # remaining columns keeps as is
+
+            # XGBoost configuration with efficiency optimizations
+            xgb = XGBClassifier(
+                eval_metric='aucor',  # Area Under Precision-Recall Curve
+                random_state=self.config['model'].get('seed', 42),
+                reg_lambda=1.0,  # L2 regularization to reduce overfitting and control model complexity  (reg_alpha ,,,l1regularization)
+                n_estimators=self.config['model']['params']['n_estimators'],  # number of boosting rounds
+                n_jobs=-1,  # uses all availble cpu for parallelism
+                tree_method=self.config['model'].get('tree_method', 'hist')
+                # builts decision trees by spliiting at various thresholds
+            )
+
+            #pipeline
+            pipeline = ImbPipeline([
+                ('preprocessor', preprocessor),
+                ('classifier', xgb),
+                ('smote', SMOTE(random_state=self.config['model'].get('seed',42))) #for balencing the imbalenced negative scenarios(ADASYN another variant)
+            ], memory='./cache')
+
+            #Hyperparameter search space design (to try with diffrent combination and find best model)
+            param_dist = {
+                "classifier__max_depth" : [3,5,7,], #controls the depth of tree for regularization
+                'classifier__subsample' :[[0.6, 0.8, 1.0]], #fractions of trainings added to tree(Stochastic gradient boosting)
+                'classifier__colsample_bytree': [0.6, 0.8, 1.0], #feature randoimization helps overfitting
+                'classifier__learning_rate': [0.01, 0.05, 0.1], #shriks the contributions of each tree(prevent overfitting)
+                'classifier__gamma': [0, 0.1, 0.3], #minimze the loss reduction
+                'classifier__reg_alpha': [0, 0.1, 0.5] #l1 regularization
+            }
+
+            #optimazation for F-beta score (find best combination oif model for above by doing mix and match
+            #we can do either by grid or random searchcv
+            searcher = RandomizedSearchCV(
+                pipeline,
+                param_dist,
+                scoring=make_scorer(fbeta_score,beta=2, zero_division=0),#recall(b>1) Out of all actual positives(actual frauds), how many did the model correctly identify?
+                n_iter = 20 , #in hyperparameter we have 6 sets with each 3 values so 6^3 which is 729 , but it tries randomly for only 20 combinations
+                n_jobs = -1 , #uses all cpu's
+                cv = StratifiedKFold(n_splits=3 , shuffle=True),
+                refit=True, #uses the best model parameter in the entire set
+                error_score='raise',
+                random_state=self.config['model'].get('seed', 42)
+            )
+
+            logger.info('Starting hyperparameter tuning...')
+            searcher.fit(X_train, y_train)  #model training
+            best_params = searcher.best_params_
+            best_model = searcher.best_estimator_
+            logger.info('Best hyperparameters: %s', best_params)
+
+            # Threshold optimization using training data
+            train_proba = best_model.predict_proba(X_train)[:, 1]
+            precision_arr, recall_arr, thresholds_arr = precision_recall_curve(y_train, train_proba)
+            f1_scores = [2 * (p * r) / (p + r) if (p + r) > 0 else 0
+                         for p, r in zip(precision_arr[:-1], recall_arr[:-1])]  #list comprehension for presion,recall
+            best_threshold = thresholds_arr[np.argmax(f1_scores)]
+            logger.info('Optimal threshold determined: %.4f', best_threshold)
+
+            #Model evaluation - testing
+            X_test_processed = best_model.named_steps['preprocessor'].transform(X_test)
+            test_proba = best_model.named_steps['classifier'].predict_proba(X_test_processed)[:, 1]
+            y_pred = (test_proba >= best_threshold).astype(int)
+
+            # Comprehensive metrics suite
+            metrics = {
+                'auc_pr': float(average_precision_score(y_test, test_proba)),
+                'precision': float(precision_score(y_test, y_pred, zero_division=0)),
+                'recall': float(recall_score(y_test, y_pred, zero_division=0)),
+                'f1': float(f1_score(y_test, y_pred, zero_division=0)),
+                'threshold': float(best_threshold)
+            }
+
+            mlflow.log_metrics(metrics)
+            mlflow.log_params(best_params)
+
+            # Confusion matrix visualization
+            cm = confusion_matrix(y_test, y_pred)
+            plt.figure(figsize=(6, 4))
+            plt.imshow(cm, interpolation='nearest', cmap=plt.cm.Blues)
+            plt.title('Confusion Matrix')
+            plt.colorbar()
+            tick_marks = np.arange(2)
+            plt.xticks(tick_marks, ['Not Fraud', 'Fraud'])
+            plt.yticks(tick_marks, ['Not Fraud', 'Fraud'])
+
+            for i in range(2):
+                for j in range(2):
+                    plt.text(j, i, format(cm[i, j], 'd'), ha='center', va='center', color='red')
+
+            plt.tight_layout()
+            cm_filename = 'confusion_matrix.png'
+            plt.savefig(cm_filename)
+            mlflow.log_artifact(cm_filename)
+            plt.close()
+
+            # Precision-Recall curve documentation
+            plt.figure(figsize=(10, 6))
+            plt.plot(recall_arr, precision_arr, marker='.', label='Precision-Recall Curve')
+            plt.xlabel('Recall')
+            plt.ylabel('Precision')
+            plt.title('Precision-Recall Curve')
+            plt.legend()
+            pr_filename = 'precision_recall_curve.png'
+            plt.savefig(pr_filename)
+            mlflow.log_artifact(pr_filename)
+            plt.close()
+
+            # Model packaging and registry
+            signature = infer_signature(X_train, y_pred)
+            mlflow.sklearn.log_model(
+                sk_model=best_model,
+                artifact_path='model',
+                signature=signature,
+                registered_model_name='fraud_detection_model'
+            )
+
+            # Model serialization for deployment
+            os.makedirs('/app/models', exist_ok=True)
+            joblib.dump(best_model, '/app/models/fraud_detection_model.pkl')
+
+            logger.info('Training successfully completed with metrics: %s', metrics)
+
+            return best_model, metrics
 
         except Exception as e:
-            pass
+            logger.error('Training failed: %s', str(e), exc_info=True)
+            raise
